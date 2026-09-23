@@ -34,7 +34,7 @@ MAX_UPSCALE_FACTOR = 2.0    # Soft interpolation limit to prevent blow-up blur
 PDF_ZOOM_FACTOR = 2.5       # Resolution scale for PDF extraction loops
 OUTPUT_MODE = "grayscale"   
 
-DENOISE_STRENGTH = 15       # Softer denoising to protect fine strokes
+DENOISE_STRENGTH = 15       # Softer denoising to protect fine lines
 LIGHT_MAP_SIZE = 110        # Larger = keeps photo tone natural while erasing shadows
 SHARPEN_AMOUNT = 1.7        # Main text sharpening weight multiplier
 SHARPEN_SIGMA = 0.8         # Focus window radius
@@ -64,7 +64,7 @@ def crop_only_pipeline(cv_img):
     doc_points = None
     for result in results:
         if result.obb is not None and len(result.obb.xyxyxyxy) > 0:
-            doc_points = result.obb.xyxyxyxy.cpu().numpy()[0].reshape(4, 2)
+            doc_points = result.obb.xyxyxyxy.cpu().numpy().reshape(4, 2)
             break
     if doc_points is None:
         h_p, w_p = int(h * 0.04), int(w * 0.04)
@@ -74,10 +74,15 @@ def crop_only_pipeline(cv_img):
     shaved = np.zeros((4, 2), dtype="float32")
     for i in range(4):
         shaved[i] = center + (rect[i] - center) * 0.992
-    w_a, w_b = np.linalg.norm(shaved[2] - shaved[3]), np.linalg.norm(shaved[1] - shaved[0])
-    h_a, h_b = np.linalg.norm(shaved[1] - shaved[2]), np.linalg.norm(shaved[0] - shaved[3])
+    
+    tl, tr, br, bl = shaved[0], shaved[1], shaved[2], shaved[3]
+    w_a = np.linalg.norm(br - bl)
+    w_b = np.linalg.norm(tr - tl)
+    h_a = np.linalg.norm(tr - br)
+    h_b = np.linalg.norm(tl - bl)
+    
     mw, mh = int(max(w_a, w_b)), int(max(h_a, h_b))
-    dst = np.array([[0,0], [mw-1,0], [mw-1,mh-1], [0,mh-1]], dtype="float32")
+    dst = np.array([[0, 0], [mw-1, 0], [mw-1, mh-1], [0, mh-1]], dtype="float32")
     M = cv2.getPerspectiveTransform(shaved.astype(np.float32), dst)
     return cv2.warpPerspective(orig_cv, M, (mw, mh), flags=cv2.INTER_CUBIC)
 
@@ -99,7 +104,9 @@ def apply_commercial_grade_enhancements(pil_img):
     if CONTRAST_BOOST > 0:
         lut = ((1.0 - CONTRAST_BOOST) * (np.arange(256)/255.0) + CONTRAST_BOOST * ((np.arange(256)/255.0)**2 * (3.0 - 2.0 * (np.arange(256)/255.0)))) * 255.0
         crisp = cv2.LUT(crisp, np.clip(lut, 0, 255).astype(np.uint8))
-    return Image.fromarray(cv2.cvtColor(cv2.cvtColor(crisp, cv2.COLOR_GRAY2BGR), cv2.COLOR_BGR2RGB))
+    
+    final_output = cv2.cvtColor(crisp, cv2.COLOR_GRAY2BGR)
+    return Image.fromarray(cv2.cvtColor(final_output, cv2.COLOR_BGR2RGB))
 
 def smart_upscale(img):
     """Upscales low-res documents cleanly to target printing parameters."""
@@ -110,7 +117,7 @@ def smart_upscale(img):
     return img.resize((int(w * f), int(h * f)), Image.Resampling.LANCZOS)
 
 # ==============================================================================
-# MAIN SESEQUENTIAL WORKFLOW LOOPS
+# MAIN SEQUENTIAL WORKFLOW LOOPS
 # ==============================================================================
 uploaded_files = st.file_uploader(
     "Upload document photos or PDF files here:", 
@@ -137,10 +144,13 @@ if uploaded_files:
                         doc = fitz.open(stream=file.read(), filetype="pdf")
                         for p_idx in range(len(doc)):
                             pix = doc[p_idx].get_pixmap(matrix=fitz.Matrix(PDF_ZOOM_FACTOR, PDF_ZOOM_FACTOR), colorspace=fitz.csRGB, alpha=False)
-                            cache.append(crop_only_pipeline(cv2.cvtColor(np.array(Image.frombytes("RGB", [pix.width, pix.height], pix.samples)), cv2.COLOR_RGB2BGR)))
+                            img_pil = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                            cv_img = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+                            cache.append(crop_only_pipeline(cv_img))
                         doc.close()
                     else:
-                        cache.append(crop_only_pipeline(cv2.imdecode(np.frombuffer(file.read(), np.uint8), 1)))
+                        cv_img = cv2.imdecode(np.frombuffer(file.read(), np.uint8), 1)
+                        cache.append(crop_only_pipeline(cv_img))
                 st.session_state.cropped_cache = cache
                 st.session_state.base_name = name
                 st.rerun()
@@ -159,7 +169,11 @@ if uploaded_files:
                     pil_img = apply_commercial_grade_enhancements(smart_upscale(Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))))
                     buf = io.BytesIO()
                     pil_img.save(buf, format="PNG")
-                    compiler.insert_pdf(fitz.open("pdf", compiler.open(stream=buf.getvalue(), filetype="png").convert_to_pdf()))
+                    buf.seek(0)
+                    
+                    # FIX: Changed compiler.open to fitz.open to resolve the core AttributeError
+                    img_doc = fitz.open("pdf", fitz.open(stream=buf.getvalue(), filetype="png").convert_to_pdf())
+                    compiler.insert_pdf(img_doc)
                 
                 out = io.BytesIO()
                 compiler.save(out)
